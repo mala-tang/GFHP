@@ -44,8 +44,8 @@ class ContrastiveRanking(nn.Module):
             indices = (labels == i).nonzero().squeeze()
             for j in range(0, nclasses):
                 x2 = data[data[:, -1] == j]
-                mean = torch.mean(x2[:, :-1], dim=0, keepdim=True)
-                sim = F.cosine_similarity(mean_v, mean)
+                sim = cosine_similarity(x, x2)
+                sim = torch.tensor(sim)
                 avg = torch.mean(sim)
                 similarity_matrix[i - 1][j - 1] = avg
                 similarity_matrix[j - 1][i - 1] = avg
@@ -58,34 +58,22 @@ class ContrastiveRanking(nn.Module):
 
         #按层次关系分层
         # DGA-200
-        # sorted_sim_l, sorted_sim_ind_l = torch.sort(similarity_matrix[:, :4], dim=1, descending=True)
-        # sorted_sim_r, sorted_sim_ind_r = torch.sort(similarity_matrix[:, 4:], dim=1, descending=True)
-        # sorted_sim_ind_r = sorted_sim_ind_r + 4
-        # # 不同层次关系中故障类别相似度排序
-        # sorted_sim, sorted_sim_ind = torch.zeros((nclasses, nclasses)), torch.zeros((nclasses, nclasses))
-        # sorted_sim[:4, :] = torch.cat((sorted_sim_l[:4, :], torch.zeros((4,3), dtype=torch.float32)), dim=1)
-        # sorted_sim[4:, :] = torch.cat((sorted_sim_r[4:, :], torch.zeros((3,4), dtype=torch.float32)), dim=1)
-        # sorted_sim_ind[:4, :] = torch.cat((sorted_sim_ind_l[:4, :], sorted_sim_ind_r[:4, :].flip(0)), dim=1)
-        # sorted_sim_ind[4:, :] = torch.cat((sorted_sim_ind_l[4:, :], sorted_sim_ind_r[4:, :].flip(0)), dim=1)
-
-        # DGA-2000
-        sorted_sim_l, sorted_sim_ind_l = torch.sort(similarity_matrix[:, 1:4], dim=1, descending=True)
+        sorted_sim_l, sorted_sim_ind_l = torch.sort(similarity_matrix[:, :4], dim=1, descending=True)
         sorted_sim_r, sorted_sim_ind_r = torch.sort(similarity_matrix[:, 4:], dim=1, descending=True)
         sorted_sim_ind_r = sorted_sim_ind_r + 4
         # 不同层次关系中故障类别相似度排序
         sorted_sim, sorted_sim_ind = torch.zeros((nclasses, nclasses)), torch.zeros((nclasses, nclasses))
-        sorted_sim[1:4, :] = torch.cat((sorted_sim_l[1:4, :], torch.zeros((3, 4), dtype=torch.float32)), dim=1)
-        sorted_sim[4:, :] = torch.cat((sorted_sim_r[4:, :], torch.zeros((3, 4), dtype=torch.float32)), dim=1)
-        sorted_sim_ind[1:4, :6] = torch.cat((sorted_sim_ind_l[1:4, :], sorted_sim_ind_r[1:4, :].flip(0)), dim=1)
-        sorted_sim_ind[4:, :6] = torch.cat((sorted_sim_ind_l[4:, :], sorted_sim_ind_r[4:, :].flip(0)), dim=1)
+        sorted_sim[:4, :] = torch.cat((sorted_sim_l[:4, :], torch.zeros((4,3), dtype=torch.float32)), dim=1)
+        sorted_sim[4:, :] = torch.cat((sorted_sim_r[4:, :], torch.zeros((3,4), dtype=torch.float32)), dim=1)
+        sorted_sim_ind[:4, :] = torch.cat((sorted_sim_ind_l[:4, :], sorted_sim_ind_r[:4, :].flip(0)), dim=1)
+        sorted_sim_ind[4:, :] = torch.cat((sorted_sim_ind_l[4:, :], sorted_sim_ind_r[4:, :].flip(0)), dim=1)
+
 
         self.class_sims_idx = {}
         for idx in range(nclasses):
             self.class_sims_idx[idx] = {}
             self.class_sims_idx[idx]['sim_class_idx2indices'] = sorted_sim_ind[idx].clone().detach().type(
                 torch.long)
-            # self.class_sims_idx[idx]['sim_class_idx2indices'] = sorted_sim_ind[idx].clone().type(
-            #     torch.long)
             self.class_sims_idx[idx]['sim_class_val'] = sorted_sim[idx]
             self.class_sims_idx[idx]['sim_class_val'][0] = 1
 
@@ -180,9 +168,8 @@ class ContrastiveRanking(nn.Module):
         sim_leq_thresh = ~sim_leq_thresh[:, :self.n_sim_classes]
         return sim_class_labels, sim_leq_thresh, sim_class_sims
 
-    def compute_InfoNCE_classSimilarity(self, anchor, pos, labels, enqueue=True):
+    def compute_InfoNCE_classSimilarity(self, anchor, pos, labels):
         l_pos = torch.einsum('nc,nc->n', [anchor, pos]).unsqueeze(-1)
-        #l_pos = torch.einsum('nc,nc->n', [anchor, self.l_proto.float()]).unsqueeze(-1)
         similar_labels, below_threshold, class_sims = self.get_similar_labels(labels)
         masks = []
         threshold_masks = []
@@ -212,12 +199,7 @@ class ContrastiveRanking(nn.Module):
             masks = new_masks
             dynamic_taus = new_taus
 
-
-        # anchor = anchor.clone().detach().double()
-        # self.l_proto = self.l_proto.clone().detach().double()
-        #l_class_pos = torch.einsum('nc,ck->nk', anchor, self.l_proto.t())
         l_class_pos = F.cosine_similarity(anchor.double().unsqueeze(1), self.l_proto.double().unsqueeze(0), dim=-1)
-        #l_class_pos = F.cosine_similarity(anchor.double().unsqueeze(1), anchor.double().unsqueeze(0), dim=-1)
         l_neg = l_class_pos.clone()
 
 

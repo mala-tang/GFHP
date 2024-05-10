@@ -15,9 +15,9 @@ from sklearn import metrics
 
 from dataloader import *
 from model_aug import *
-from utils_aug import *
+from utils_tsne import *
 
-from loss import *
+from loss_update import *
 
 
 
@@ -35,51 +35,40 @@ def set_env(seed):
     torch.backends.cudnn.deterministic = True
 
 
-def train_cl(cl_model, optimizer_cl, baseline_classifier, optimizer_baseline, x1, x2, adj_1, adj_2, criterion, idx_train, cur_split, label):
+def train_cl(cl_model, optimizer_cl, baseline_classifier, optimizer_baseline, x1, x2, adj_1, adj_2, criterion, idx_train, label): #cur_split,
     cl_model.train()
     baseline_classifier.eval()
 
-    optimizer_cl.zero_grad()
-    #optimizer_baseline.zero_grad()
-
-
-    emb1 = cl_model.get_emb1(x1, adj_1)
-    emb2 = cl_model.get_emb2(x2, adj_2)
+    emb1, emb2, cl_loss = cl_model.RINCE(x1, adj_1, x2, adj_2, criterion, label, idx_train)
     pred1 = baseline_classifier(emb1)
     pred2 = baseline_classifier(emb2)
-    log_pred1 = F.softmax(pred1, dim=1)
-    log_pred2 = F.softmax(pred2, dim=1)
-    class_loss = F.cross_entropy(pred1[idx_train[:, cur_split]], label[idx_train[:,cur_split]].long())
-    kl_loss = F.kl_div(log_pred1/5, log_pred2/5, reduction='batchmean')
-    cl_loss = cl_model.RINCE(x1, adj_1, x2, adj_2, criterion, label)
-    loss = 0.04 * cl_loss + class_loss + 0.06 * kl_loss
-    #print(loss)
+    kl_loss = F.kl_div(
+        F.log_softmax(pred1, dim=1),
+        F.softmax(pred2, dim=1),
+        reduction='batchmean'
+    )
+    class_loss = F.cross_entropy(pred1[idx_train], label[idx_train].long())
 
-    loss.backward(retain_graph=True)#retain_graph=True
+
+    loss = class_loss + 0.6*class_loss + 0.4*kl_loss
+
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(cl_model.parameters(), max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(baseline_classifier.parameters(), max_norm=1.0)
     optimizer_cl.step()
-    #optimizer_baseline.step()
-
-    return cl_loss.item()#, loss.item()#, main_loss.item(), total_loss.item()
-
-def train_GCNModel(baseline_classifier, optimizer_baseline, optimizer_cl, cl_model, feature, label, idx_train, adj_1, cur_split):
-    baseline_classifier.train()
-    cl_model.eval()
-
-    emb = cl_model.get_emb1(feature, adj_1)
-
-    output = baseline_classifier(emb)
-    loss_train = F.cross_entropy(output[idx_train[:, cur_split]], label[idx_train[:,cur_split]].long())
-
-    baseline_classifier.zero_grad()
-    #optimizer_cl.zero_grad()
-    loss_train.backward()
     optimizer_baseline.step()
-    #optimizer_cl.step()
-    return loss_train
+
+
+    optimizer_cl.zero_grad()
+    optimizer_baseline.zero_grad()
+    return cl_loss.item()
+
 
 def main(args):
     torch.cuda.empty_cache()
-    feature, weights, label, idx_train,  idx_test, n_feat, n_class = load_data()
+    train_epoch_begin_time = time.perf_counter()
+    feature, weights, label, n_feat, n_class, class_sims_idx, l_proto, train_mask,  test_mask = load_data()
 
     if torch.cuda.is_available():
         device = torch.cuda.set_device(0)
@@ -87,80 +76,61 @@ def main(args):
         device = torch.device('cpu')
     weights = sp.coo_matrix(weights)
     adj = get_adj(weights, 'sym_renorm_adj')
-
     if sp.issparse(feature):
         feature = cnv_sparse_mat_to_coo_tensor(feature, device)
     else:
         feature = feature.to(device)
     adj = cnv_sparse_mat_to_coo_tensor(adj, device)
-
     x1, adj_1 = perturb_graph(feature, adj, 0.1, 0.1, args)
     x2, adj_2 = perturb_graph(feature, adj, 0.1, 0.1, args)
     label = label.to(device)
-    idx_train = idx_train.to(device)
-    idx_test = idx_test.to(device)
     results, f1_result, auc_result, pre_result = [], [], [], []
+    cl_model = GCL(device, nlayers=args.nlayers, n_input=n_feat, n_hid=int(args.n_hid), n_output=int(args.n_hid / 2),
+                   droprate=args.droprate, sparse=args.sparse, batch_size=args.cl_batch_size,
+                   enable_bias=args.enable_bias).to(device)
+    criterion = ContrastiveRanking(args, feature, label, len(torch.unique(label)), n_feat, int(args.n_hid / 2),
+                                   class_sims_idx, l_proto).to(device)
+    optimizer_cl = torch.optim.Adam(cl_model.parameters(), lr=args.lr_clas, weight_decay=args.w_decay)
+    baseline_classifier = GCN_Classifier(ninput=int(args.n_hid / 2),
+                                         nclass=len(torch.unique(label)), dropout=args.droprate).to(device)
+    optimizer_baseline = torch.optim.Adam(baseline_classifier.parameters(), lr=args.lr_gcl, weight_decay=args.w_decay)
 
     for trial in range(args.ntrials):
-        set_env(trial)
-        cl_model = GCL(device, nlayers=args.nlayers, n_input=n_feat, n_hid=int(args.n_hid), n_output=int(args.n_hid/2),
-                       droprate=args.droprate, sparse=args.sparse, batch_size=args.cl_batch_size,
-                       enable_bias=args.enable_bias).to(device)
-        criterion = ContrastiveRanking(args, feature, label, len(torch.unique(label)), n_feat, int(args.n_hid/2)).to(device)
-        optimizer_cl = torch.optim.Adam(cl_model.parameters(), lr=args.lr_clas, weight_decay=args.w_decay)
-        baseline_classifier = GCN_Classifier(ninput=int(args.n_hid/2),
-                                             # 因为encoder1和encoder2的输出是64(args.embedding_dim = 64)
-                                             nclass=len(torch.unique(label)), dropout=args.droprate).to(device)
-        optimizer_baseline = torch.optim.Adam(baseline_classifier.parameters(),  # GCN分类器
-                                              lr=args.lr_gcl, weight_decay=args.w_decay)
-
-        cur_split = 0 if (idx_train.shape[1] == 1) else (trial % idx_train.shape[1])
+        cur_split = 0 if (train_mask.shape[1] == 1) else (trial % train_mask.shape[1])
+        idx_train = train_mask[:, cur_split]
+        idx_test = test_mask[:, cur_split]
         best_acc, best_f1, best_auc, best_pre = 0, 0, 0, 0
-
         for epoch in range(1, args.epochs + 1):
+            train_cl(cl_model, optimizer_cl, baseline_classifier, optimizer_baseline, x1, x2, adj_1, adj_2, criterion, idx_train, label)
+            embed = cl_model.get_emb1(x1, adj_1)
+            with torch.no_grad():
+                output = baseline_classifier(embed)
+                loss_test = F.cross_entropy(output[idx_test],
+                                            label[idx_test].long())
+                f1_test, auc_test, precision_test, cm, prec, f1, acc = calc_accuracy(output[idx_test], label[idx_test].long())
 
-            train_time_list = []
-            train_epoch_begin_time = time.perf_counter()
-            #, class_loss
-            cl_loss = train_cl(cl_model, optimizer_cl, baseline_classifier, optimizer_baseline, x1, x2, adj_1, adj_2, criterion, idx_train, cur_split, label)
-            class_loss = train_GCNModel(baseline_classifier, optimizer_baseline, optimizer_cl, cl_model, feature, label, idx_train,
-                                        adj_1, cur_split)
-            embed = cl_model.get_emb1(feature, adj_1)
-            output = baseline_classifier(embed)
-            f1_train, auc_train = calc_accuracy(output[idx_train[:, cur_split]],
-                                                                            label[idx_train[:, cur_split]].long())
-
-            train_epoch_end_time = time.perf_counter()
-            train_epoch_time_duration = train_epoch_end_time - train_epoch_begin_time
-            train_time_list.append(train_epoch_time_duration)
-
-            print("[TRAIN] Epoch:{:04d} | CL Loss {:.4f} | Class loss:{:.4f} | f1_train:{:.2f}| auc_train:{:.2f} | Training duration: {:.6f}".\
-                  format(epoch, cl_loss, class_loss, f1_train, auc_train, train_epoch_time_duration))
-
-            if epoch % args.eval_freq == 0 and epoch > 100:
-                cl_model.eval()
-                baseline_classifier.eval()
-                embed = cl_model.get_emb1(feature, adj_1)
-                with torch.no_grad():
-                    output = baseline_classifier(embed)
-                    loss_test = F.cross_entropy(output[idx_test[:, cur_split]],
-                                                label[idx_test[:, cur_split]].long())
-                    f1_test, auc_test = calc_accuracy(output[idx_test[:, cur_split]], label[idx_test[:, cur_split]].long())
-
-                print(
-                    '[TEST] Epoch:{:04d} | Main loss:{:.4f} | f1_test:{:.2f}| auc_test:{:.2f}|'.format(epoch, loss_test.item(), f1_test, auc_test))
-                if f1_test > best_f1:
-                    best_f1 = f1_test
-                    best_auc = auc_test
-                    best_split = cur_split
+            print(
+                '[TEST] Epoch:{:04d} | Main loss:{:.4f} | f1_test:{:.2f}| auc_test:{:.2f}| pre_test:{:.2f}'.format(epoch,
+                                                                                                   loss_test.item(),
+                                                                                                   f1_test, auc_test,precision_test))
+            if f1_test > best_f1:
+                best_f1 = f1_test
+                best_auc = auc_test
+                best_pre = precision_test
 
         f1_result.append(best_f1)
         auc_result.append(best_auc)
+        pre_result.append(best_pre)
 
+    train_epoch_end_time = time.perf_counter()
+    train_epoch_time_duration = train_epoch_end_time - train_epoch_begin_time
     f1_result = np.array(f1_result, dtype=np.float32)
     auc_result = np.array(auc_result, dtype=np.float32)
-    print('\n[FINAL RESULT] Dataset:{} | Run:{} | f1:{:.2f}+-{:.2f} | AUC:{:.2f}+-{:.2f}'
-            .format(args.dataset, args.ntrials, np.mean(f1_result), np.std(f1_result), np.mean(auc_result), np.std(auc_result)))
+    print('\n[FINAL RESULT] Dataset:{} | Run:{} | f1:{:.2f}+-{:.2f} | AUC:{:.2f}+-{:.2f} | Precision:{:.2f}+-{:.2f}'
+          .format(args.dataset, args.ntrials, np.mean(f1_result), np.std(f1_result), np.mean(auc_result),
+                  np.std(auc_result)
+                  , np.mean(pre_result), np.std(pre_result)))
+    print(f'time:{train_epoch_time_duration}')
 
     return 0
 
@@ -170,11 +140,11 @@ if __name__ == "__main__":
     # ESSENTIAL
 
     parser.add_argument('-ntrials', type=int, default=10)
-    parser.add_argument('-eval_freq', type=int, default=50)
-    parser.add_argument('-epochs', type=int, default=500)#400
+    parser.add_argument('-eval_freq', type=int, default=1)
+    parser.add_argument('-epochs', type=int, default=100)
     parser.add_argument('-lr_gcl', type=float, default=0.01)
-    parser.add_argument('-lr_clas', type=float, default=0.01)
-    parser.add_argument('-w_decay', type=float, default=0.)
+    parser.add_argument('-lr_clas', type=float, default=0.001)
+    parser.add_argument('-w_decay', type=float, default=0.000)
     parser.add_argument('-droprate', type=float, default=0.005)
     parser.add_argument('-sparse', type=int, default=1)
     parser.add_argument('-dataset', type=str, default='DGA-200')
@@ -183,8 +153,8 @@ if __name__ == "__main__":
 
 
     # GCN Module - Hyper-param
-    parser.add_argument('-nlayers', type=int, default=4)
-    parser.add_argument('-n_hid', type=int, default=256)#128
+    parser.add_argument('-nlayers', type=int, default=2)
+    parser.add_argument('-n_hid', type=int, default=128)
     parser.add_argument('-cl_batch_size', type=int, default=0)
 
     # stuff for ranking
@@ -193,11 +163,11 @@ if __name__ == "__main__":
     parser.add_argument('--m', default=0.99, type=float, help='momentum update to use in contrastive learning')
     parser.add_argument('--do_sum_in_log', type=str2bool, default='True')
 
-    parser.add_argument('--similarity_threshold', default=0.01, type=float, help='')
-    parser.add_argument('--n_sim_classes', default=7, type=int, help='')
+    parser.add_argument('--similarity_threshold', default=0.1, type=float, help='')
+    parser.add_argument('--n_sim_classes', default=6, type=int, help='')
     parser.add_argument('--use_dynamic_tau', type=str2bool, default='True', help='')
     parser.add_argument('--use_supercategories', type=str2bool, default='False', help='')
-    parser.add_argument('--use_same_and_similar_class', type=str2bool, default='True', help='')
+    parser.add_argument('--use_same_and_similar_class', type=str2bool, default='False', help='')
     parser.add_argument('--one_loss_per_rank', type=str2bool, default='False')
     parser.add_argument('--mixed_out_in', type=str2bool, default='False')
     parser.add_argument('--roberta_threshold', type=str, default=None,
@@ -209,6 +179,6 @@ if __name__ == "__main__":
     parser.add_argument('--out_in_log', type=str2bool, default='False', help='')
 
     args = parser.parse_args()
-
+    set_env(42)
     print(args)
     main(args)

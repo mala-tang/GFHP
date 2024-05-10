@@ -13,10 +13,9 @@ class GraphConv(nn.Module):
 
     def __init__(self, in_features, out_features, bias):
         super(GraphConv, self).__init__()
-        self.weight = nn.Parameter(torch.Tensor(in_features, out_features)).double()
+        self.weight = nn.Parameter(torch.Tensor(in_features, out_features))
         if bias:
             self.bias = nn.Parameter(torch.FloatTensor(out_features))
-
         else:
             self.register_parameter('bias', None)
         self.reset_parameters()
@@ -31,17 +30,21 @@ class GraphConv(nn.Module):
     """"""
     def forward(self, x, filter):
 
-        if x.is_sparse:
-            first_mul = torch.sparse.mm(x, self.weight)
-        else:
-            x = x.double()
-            first_mul = torch.mm(x, self.weight)
-        if filter.is_sparse:
-            filter = filter.float()
-            first_mul = first_mul.float()
-            second_mul = torch.sparse.mm(filter, first_mul)
-        else:
-            second_mul = torch.mm(filter, first_mul)
+        # if x.is_sparse:
+        #     first_mul = torch.sparse.mm(x, self.weight)
+        # else:
+        #     x = x.double()
+        #     first_mul = torch.mm(x, self.weight)
+        # if filter.is_sparse:
+        #     filter = filter.float()
+        #     first_mul = first_mul.float()
+        #     second_mul = torch.sparse.mm(filter, first_mul)
+        # else:
+        #     second_mul = torch.mm(filter, first_mul)
+        x = x.to(torch.float32) if not x.is_sparse else x
+        # adj = adj.to(torch.float32)
+        self.weight = self.weight.to(torch.float32)
+        second_mul = filter @ (x @ self.weight)
         
         if self.bias is not None:
             graph_conv = torch.add(input=second_mul, other=self.bias, alpha=1)
