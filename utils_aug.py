@@ -2,11 +2,6 @@ import torch
 import numpy as np
 import scipy.sparse as sp
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from matplotlib.patches import Ellipse
-from adjustText import adjust_text
-from matplotlib.lines import Line2D
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score, confusion_matrix
 
 plt.rcParams['axes.unicode_minus'] = False
